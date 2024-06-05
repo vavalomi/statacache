@@ -1,7 +1,7 @@
 /*
     In order for a (user-written) program to be cachable it needs to setisfy the following:
     1. define program properties and include 'cachable' in the list: properties(cachable)
-    2. be an r-class program which implements syntax-based parameter parsing.
+    2. be an r-class, e-class, or s-class program which implements syntax-based parameter parsing.
     3. accept 'signature' option that returns signature text, which would uniquely identify the resulting data
     4.1. if results are left in memory, specify properties(cachable MEMory)
     4.2. if results are left in a frame, specify properties(cachable frame option_name)
@@ -17,7 +17,7 @@ program define datacache
     load_settings
     local storage "`r(storage)'"
 
-	gettoken cacheoptions subcmd : 0, parse(": ")
+	gettoken cacheoptions subcmd : 0, parse(":")
     if "`cacheoptions'" == ":" {
         local cacheoptions
     }
@@ -25,28 +25,74 @@ program define datacache
     	gettoken trash subcmd : subcmd, parse(": ")
     }
 
-	display `"`subcmd'"'
-    if strpos("`subcmd'", ",") == 0 local subcmd1 "`subcmd',"
-    else local subcmd1 "`subcmd'"
+    local 0 : copy local cacheoptions
+    syntax , [nocache update Disk Frame MEMory option_name(string) signature(string)]
 
+
+    if "`cache'" == "nocache" {
+        if "$DATACACHE_VERBOSE" != "" {
+            display as text "nocache option received, execute and exit"
+        }
+        noisily capture `subcmd'
+        exit `=_rc'
+    }
+
+    if "$DATACACHE_VERBOSE" != "" {
+	    display `"`subcmd'"'
+    }
+
+    if strpos(`"`subcmd'"', ",") == 0 local subcmd1 "`subcmd',"
+    else local subcmd1 "`subcmd'"
     gettoken cmdname cmdline : subcmd1, parse(", ")
-    local props : properties `cmdname'
-    local 0  ", `props'"
-    syntax, [cachable Disk Frame MEMory *]
+
+    if "`disk'`frame'`memory'`option_name'`signature'" == "" {
+        // no direct parameters were provided, let's see if the command itself
+        // defines them
+
+        local props : properties `cmdname'
+        local 0  ", `props'"
+        syntax, [cachable Disk Frame MEMory *]
+        local option_name : word 1 of "`options'"
+    }
+    else {
+        local cachable "cachable"
+    }
 
     if "`cachable'" == "" {
-        display as text "NON-CACHABLE command, execute and exit"
-        `subcmd'
-        exit
+        if "$DATACACHE_VERBOSE" != "" {
+            display as text "NON-CACHABLE command, execute and exit"
+        }
+        noisily capture `subcmd'
+        exit `=_rc'
     }
-    // get the command signature
-	`subcmd1' signature
 
-    local unique_signature "`cmdname'|`r(signature)'"
+    local results : results `cmdname'
+
+    if "`signature'" == "" {
+        // get the command signature
+
+        if "`results'" == "nclass" {
+            if "$DATACACHE_VERBOSE" != "" {
+                display as text "command doesn't implement signature, execute and exit"
+            }
+            noisily capture `subcmd'
+            exit `=_rc'
+        }
+        else {
+            local signature_macro = subinstr("`results'", "class", "", .) + "(signature)" // r(signature), e(signature), or s(signature)
+        }
+
+        `subcmd1' signature
+    }
+    else {
+        local signature_macro "signature"
+    }
+
+    local unique_signature "`cmdname'|``signature_macro''"
 	mata st_local("fname", urlencode(base64encode(st_local("unique_signature"))))
 	mata st_local("cached_dataset", pathjoin("`storage'", "`fname'.dta"))
+    local returns_file : subinstr local cached_dataset ".dta" ".ret"
 
-    local option_name : word 1 of "`options'"
     if "`frame'" != "" {
         local prog_type "FRAME"
     }
@@ -54,9 +100,9 @@ program define datacache
         local prog_type "DISK"
     }
 
+    local 0 : copy local cmdline
     if "`prog_type'" != "" {
         // we need to parse cmdline content to get the parameter value
-        local 0 : copy local cmdline
         // option_name is required so this command would correctly catch that
         // =exp and weights cannot be present at the same time, so need to check twice
         capture syntax [anything] [if] [in] [using/] [fweight  aweight  pweight  iweight], `option_name'(string asis) [clear replace *]
@@ -71,25 +117,40 @@ program define datacache
         }
     }
     else {
+        capture syntax [anything] [if] [in] [using/] [fweight  aweight  pweight  iweight], [clear replace *]
+        if _rc {
+            syntax [anything] [if] [in] [using/] [=exp], [clear replace *]
+        }
         // current memory option is equivalent of using the default frame
         local prog_type "FRAME"
         local frame_name "default"
     }
 
-	if !fileexists("`cached_dataset'") {
-	    `subcmd'
+	if !fileexists("`cached_dataset'") | "`update'" == "update" {
+	    noisily capture `subcmd'
+        if _rc {
+            exit `=_rc'
+        }
         if "`prog_type'" == "FRAME" {
             frame `frame_name' {
-                save "`cached_dataset'", replace
+                char _dta[version] $S_DATE
+                quietly save "`cached_dataset'", replace
                 global S_FN
                 global S_FNDATE
             }
         }
         else if "`prog_type'" == "DISK" {
-            copy "`result_dataset'" "`cached_dataset'", replace
+            quietly {
+                use "`result_dataset'"
+                char _dta[version] $S_DATE
+                copy "`result_dataset'" "`cached_dataset'", replace
+            }
         }
+        quietly save_returned "`results'" "`returns_file'"
     
-	    display as text "STORED TO CACHE: " as result `"[`fname']"'
+	    if "$DATACACHE_VERBOSE" != "" {
+            display as text "STORED TO CACHE: " as result `"[`fname']"'
+        }
     }
 	else {
         if "`prog_type'" == "FRAME" {
@@ -97,10 +158,12 @@ program define datacache
             frame `frame_name': use "`cached_dataset'", `clear'
         }
         else if "`prog_type'" == "DISK" {
-            copy "`cached_dataset'" "`result_dataset'", `replace'
+            quietly copy "`cached_dataset'" "`result_dataset'", `replace'
         }
-
-		display as text "RETRIEVED FROM CACHE: " as result `"[`fname']"'
+        load_returned "`results'" "`returns_file'"
+        if "$DATACACHE_VERBOSE" != "" {
+		    display as text "RETRIEVED FROM CACHE: " as result `"[`fname']"'
+        }
 	}
 end
 
@@ -112,7 +175,7 @@ program define load_settings
         save_settings
     }
 
-    include "`settings_file'"
+    quietly include "`settings_file'"
 end
 
 program define save_settings
@@ -141,4 +204,72 @@ program define datacache_settings, rclass
 
     capture mkdir "`storage'"
     return local storage "`storage'"
+end
+
+program define save_returned
+    args results tofile
+
+    if "`results'" == "nclass" {
+        // nothing to store
+        exit
+    }
+    if "`results'" == "eclass" {
+        estimates store `tofile', replace
+        exit
+    }
+
+    tempname fh
+    file open `fh' using `tofile', write text replace
+    foreach sc in `: r(scalars)' {
+        file write `fh' "return scalar `sc' = `=r(`sc')'" _n
+    }
+    foreach loc in `: r(macros)' {
+        file write `fh' `"return local `loc' = "`=r(`loc')'""' _n
+    }
+    file close `fh'
+
+end
+
+program define load_returned
+    args results fromfile
+
+    if !fileexists("`fromfile'") {
+        exit
+    }
+
+    if "`results'" == "eclass" {
+        estimates use `fromfile'
+    }
+    else {
+        tempname fh
+        file open `fh' using `fromfile', read text    
+        file read `fh' line
+        if `"`line'"' == "" {
+            exit
+        }
+        local lines `"`"`line'"'"'
+        while r(eof)==0 {
+            file read `fh' line
+            local lines `"`lines' `"`line'"'"'
+        }
+        file close `fh'
+        if "`results'" == "rclass" {
+            post_return `lines'
+        }
+        else {
+            post_sreturn `lines'
+        }
+    }
+end
+
+program define post_sreturn, sclass
+    foreach line of local 0 {
+        `line'
+    }
+end
+
+program define post_return, rclass
+    foreach line of local 0 {
+        `line'
+    }
 end
