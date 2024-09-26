@@ -11,8 +11,7 @@ program define getdataheavy, rclass properties(cachable disk target)
 	if "`signature'" != "" {
 		// form signature as canonical options list
 		local signature=`"country(`country')|indicator(`indicator')"'
-		return local signature = `"`signature'"'
-		return local restype="file" // as opposed to "memory"
+		return local signature `"`signature'"'
 		exit
 	}
 	display `"`target'"' "from" `"`0'"'
@@ -38,7 +37,6 @@ program define example_memory, rclass properties(cachable)
 		// form signature as canonical options list
 		local signature=`"country(`country')|indicator(`indicator')"'
 		return local signature = `"`signature'"'
-		return local restype="file" // as opposed to "memory"
 		exit
 	}
 	sleep 5000
@@ -46,6 +44,8 @@ program define example_memory, rclass properties(cachable)
 	tempfile aa
 	getdataheavy, country(`country') indicator(`indicator') target(`aa')
 	use `aa', `clear'
+	return local aaa "there is a text"
+	return scalar d = 3
 end
 
 // non-achable comand
@@ -59,16 +59,33 @@ program define example_any, rclass
 	sysuse auto, clear
 end
 
-
 capture program drop datacache
+timer clear
+clear
+
+timer on 1
+datacache: getdataheavy , target(c:\temp\getheavy.dta) country(ALB) indicator(SP.POP.TOTL) replace
+confirm file c:\temp\getheavy.dta
+timer off 1
 
 clear
-datacache: getdataheavy , target(c:\temp\getheavy.dta) country() indicator(SP.POP.TOTL) replace
+timer on 2
+datacache : example_memory , country(ALB) indicator(SP.POP.TOTL)
+describe, short
+timer off 2
 
 clear
-datacache : example_memory , country() indicator(SP.POP.TOTL)
+timer on 3
+datacache : example_any
+describe, short
+timer off 3
 
 clear
-datacache , : example_any, country() indicator(SP.POP.TOTL)
+timer on 4
+datacache, memory signature("aa") : example_any
+describe, short
+timer off 4
+
+timer list
 
 // END OF FILE

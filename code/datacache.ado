@@ -1,5 +1,5 @@
 /*
-    In order for a (user-written) program to be cachable it needs to setisfy the following:
+    In order for a (user-written) program to be cachable it needs to satisfy the following:
     1. define program properties and include 'cachable' in the list: properties(cachable)
     2. be an r-class, e-class, or s-class program which implements syntax-based parameter parsing.
     3. accept 'signature' option that returns signature text, which would uniquely identify the resulting data
@@ -7,7 +7,10 @@
     4.2. if results are left in a frame, specify properties(cachable frame option_name)
     4.3. if results are saved to a file on disk, specify properties(cachable disk option_name)
     if none of the above are provided, memory option would be assumed by default
-    option_name means that destination frame name or file path should be read from the option_name() parameter of the call
+    option_name means that the destination frame name or file path should be read from the option_name() parameter of the call
+
+    Alternatively, the caller script may contain the necessary information about an otherwise non-cacheable command;
+    datacache, disk option_name(saveto) signature(sometext) : command, ...
 */
 
 program define datacache
@@ -89,9 +92,10 @@ program define datacache
     }
 
     local unique_signature "`cmdname'|``signature_macro''"
-	mata st_local("fname", urlencode(base64encode(st_local("unique_signature"))))
-	mata st_local("cached_dataset", pathjoin("`storage'", "`fname'.dta"))
-    local returns_file : subinstr local cached_dataset ".dta" ".ret"
+    find_file "`unique_signature'"
+    local cached_dataset "`r(readpath)'"
+    local cache_to_save "`r(savepath)'"
+    local returns_file : subinstr local cache_to_save ".dta" ".ret"
 
     if "`frame'" != "" {
         local prog_type "FRAME"
@@ -126,15 +130,22 @@ program define datacache
         local frame_name "default"
     }
 
-	if !fileexists("`cached_dataset'") | "`update'" == "update" {
+	if "`cached_dataset'" == "" | "`update'" == "update" {
 	    noisily capture `subcmd'
         if _rc {
-            exit `=_rc'
+            exit = _rc
         }
         if "`prog_type'" == "FRAME" {
             frame `frame_name' {
                 char _dta[version] $S_DATE
-                quietly save "`cached_dataset'", replace
+                capture save "`cache_to_save'", replace
+                if _rc == 111 {
+                    // no variables defined error
+                    exit 2000
+                }
+                else if _rc > 0 {
+                    exit = _rc
+                }
                 global S_FN
                 global S_FNDATE
             }
@@ -143,7 +154,7 @@ program define datacache
             quietly {
                 use "`result_dataset'"
                 char _dta[version] $S_DATE
-                copy "`result_dataset'" "`cached_dataset'", replace
+                copy "`result_dataset'" "`cache_to_save'", replace
             }
         }
         quietly save_returned "`results'" "`returns_file'"
@@ -174,7 +185,8 @@ program define load_settings
     if fileexists("`settings_file'") == 0 {
         save_settings
     }
-
+    global DATACACHE_STORAGE
+    global DATACACHE_FINDER
     quietly include "`settings_file'"
 end
 
@@ -200,9 +212,16 @@ program define save_settings
 end
 
 program define datacache_settings, rclass
-    syntax, storage(string)
+    syntax, storage(string) [finder(string)]
 
-    capture mkdir "`storage'"
+    if "`finder'" == "" {
+        global DATACACHE_STORAGE_DEFAULT : copy local storage
+        capture mkdir "`storage'"
+    }
+    else {
+        global DATACACHE_STORAGE `"$DATACACHE_STORAGE "`storage'""'
+        global DATACACHE_FINDER `"$DATACACHE_FINDER "`finder'""'
+    }
     return local storage "`storage'"
 end
 
@@ -272,4 +291,38 @@ program define post_return, rclass
     foreach line of local 0 {
         `line'
     }
+end
+
+program define find_file, rclass
+    args signature
+
+    local found = 0
+    local i = 1
+    local storage_list $DATACACHE_STORAGE_DEFAULT $DATACACHE_STORAGE
+    local finder_list "default" $DATACACHE_FINDER
+
+    mata st_local("fname", urlencode(base64encode(st_local("signature"))))
+
+    foreach storage of local storage_list {
+        local finder : word `i' of "`finder_list'"
+
+        mata st_local("readpath", pathjoin("`storage'", "`fname'.dta"))
+
+        if "`finder'" == "default" {
+            local savepath : copy local readpath
+        }
+        else {
+            capture `finder' "`signature'" // must return the file path
+            local readpath "`r(fullpath)'"
+        }
+        if fileexists("`readpath'") {
+            local found = 1
+            continue, break
+        }
+        local ++i
+    }
+    if `found' {
+        return local readpath "`readpath'"
+    }
+    return local savepath "`savepath'"
 end
