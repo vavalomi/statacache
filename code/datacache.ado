@@ -29,19 +29,19 @@ program define datacache
     }
 
     local 0 : copy local cacheoptions
-    syntax , [nocache update Disk Frame MEMory option_name(string) signature(string)]
-
+    syntax , [nocache update Disk Frame MEMory option_name(string) signature(string) DRYrun]
 
     if "`cache'" == "nocache" {
         if "$DATACACHE_VERBOSE" != "" {
             display as text "nocache option received, execute and exit"
         }
-        noisily capture `subcmd'
-        exit `=_rc'
-    }
+        if "`dryrun'" != "" {
+            mata: st_numscalar("r(executed)", 1)
+            exit
+        }
 
-    if "$DATACACHE_VERBOSE" != "" {
-	    display `"`subcmd'"'
+        capture noisily `subcmd'
+        exit `=_rc'
     }
 
     if strpos(`"`subcmd'"', ",") == 0 local subcmd1 "`subcmd',"
@@ -65,7 +65,12 @@ program define datacache
         if "$DATACACHE_VERBOSE" != "" {
             display as text "NON-CACHABLE command, execute and exit"
         }
-        noisily capture `subcmd'
+        if "`dryrun'" != "" {
+            mata: st_numscalar("r(executed)", 1)
+            exit
+        }
+
+        capture noisily `subcmd'
         exit `=_rc'
     }
 
@@ -78,13 +83,21 @@ program define datacache
             if "$DATACACHE_VERBOSE" != "" {
                 display as text "command doesn't implement signature, execute and exit"
             }
-            noisily capture `subcmd'
+            if "`dryrun'" != "" {
+                mata: st_numscalar("r(executed)", 1)
+                exit
+            }
+
+            capture noisily `subcmd'
             exit `=_rc'
         }
         else {
             local signature_macro = subinstr("`results'", "class", "", .) + "(signature)" // r(signature), e(signature), or s(signature)
         }
 
+        if "`dryrun'" != "" {
+            mata: st_numscalar("r(executed_signature)", 1)
+        }
         `subcmd1' signature
     }
     else {
@@ -131,13 +144,16 @@ program define datacache
     }
 
 	if "`cached_dataset'" == "" | "`update'" == "update" {
-	    noisily capture `subcmd'
+        if "`dryrun'" != "" {
+            mata: st_numscalar("r(executed)", 1)
+            exit
+        }
+	    capture noisily `subcmd'
         if _rc {
             exit = _rc
         }
         if "`prog_type'" == "FRAME" {
             frame `frame_name' {
-                char _dta[version] $S_DATE
                 capture save "`cache_to_save'", replace
                 if _rc == 111 {
                     // no variables defined error
@@ -151,16 +167,12 @@ program define datacache
             }
         }
         else if "`prog_type'" == "DISK" {
-            quietly {
-                use "`result_dataset'"
-                char _dta[version] $S_DATE
-                copy "`result_dataset'" "`cache_to_save'", replace
-            }
+            quietly copy "`result_dataset'" "`cache_to_save'", replace
         }
         quietly save_returned "`results'" "`returns_file'"
     
 	    if "$DATACACHE_VERBOSE" != "" {
-            display as text "STORED TO CACHE: " as result `"[`fname']"'
+            display as text "STORED TO CACHE: " as result `"[`cached_dataset]"'
         }
     }
 	else {
@@ -173,9 +185,10 @@ program define datacache
         }
         load_returned "`results'" "`returns_file'"
         if "$DATACACHE_VERBOSE" != "" {
-		    display as text "RETRIEVED FROM CACHE: " as result `"[`fname']"'
+		    display as text "RETRIEVED FROM CACHE: " as result `"[`cached_dataset']"'
         }
 	}
+    mata: st_numscalar("r(executed)", 0)
 end
 
 program define load_settings
@@ -185,6 +198,7 @@ program define load_settings
     if fileexists("`settings_file'") == 0 {
         save_settings
     }
+    
     global DATACACHE_STORAGE
     global DATACACHE_FINDER
     quietly include "`settings_file'"
@@ -211,8 +225,10 @@ program define save_settings
     file close `fh'
 end
 
-program define datacache_settings, rclass
-    syntax, storage(string) [finder(string)]
+program define datacache_settings
+    syntax, [storage(string) finder(string)]
+
+    opts_exclusive "`storage' `finder'"
 
     if "`finder'" == "" {
         global DATACACHE_STORAGE_DEFAULT : copy local storage
@@ -222,7 +238,6 @@ program define datacache_settings, rclass
         global DATACACHE_STORAGE `"$DATACACHE_STORAGE "`storage'""'
         global DATACACHE_FINDER `"$DATACACHE_FINDER "`finder'""'
     }
-    return local storage "`storage'"
 end
 
 program define save_returned
@@ -298,31 +313,53 @@ program define find_file, rclass
 
     local found = 0
     local i = 1
-    local storage_list $DATACACHE_STORAGE_DEFAULT $DATACACHE_STORAGE
-    local finder_list "default" $DATACACHE_FINDER
 
-    mata st_local("fname", urlencode(base64encode(st_local("signature"))))
+    foreach finder of global DATACACHE_FINDER {
 
-    foreach storage of local storage_list {
-        local finder : word `i' of "`finder_list'"
-
-        mata st_local("readpath", pathjoin("`storage'", "`fname'.dta"))
-
-        if "`finder'" == "default" {
-            local savepath : copy local readpath
+        capture noisily `finder' "`signature'" // must return the file path
+        if _rc > 0 {
+            if _rc == 199 {
+                if "$DATACACHE_VERBOSE" != "" {
+                    display as text "Custom finder settings were specified, but the command was not found"
+                    // ignore the error
+                }
+            }
+            else { // the finder was present but returned error, abort
+                exit `=_rc'
+            }
         }
-        else {
-            capture `finder' "`signature'" // must return the file path
-            local readpath "`r(fullpath)'"
-        }
+        local readpath "`r(fullpath)'"
+
         if fileexists("`readpath'") {
             local found = 1
-            continue, break
+            continue, break // the first (non-default) storage gets the priority
         }
         local ++i
+        local readpath
     }
-    if `found' {
-        return local readpath "`readpath'"
+
+    default_finder "`signature'" // we always use the default location for saving new files
+    local readsavepath "`r(readsavepath)'"
+
+    if `found' == 0 {
+        if fileexists("`readsavepath'") {
+            local readpath "`readsavepath'"
+        }
     }
-    return local savepath "`savepath'"
+    return local readpath "`readpath'"
+    return local savepath "`readsavepath'"
+
+end
+
+program define default_finder
+    // default cache storage is a single folder with all cached files saved in it
+    args signature
+
+    mata st_global( ///
+        "r(readsavepath)", ///
+        pathjoin( ///
+            st_global("DATACACHE_STORAGE_DEFAULT"), ///
+            urlencode(base64encode(st_local("signature"))) + ".dta" ///
+        ) ///
+    )
 end
